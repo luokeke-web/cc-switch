@@ -28,8 +28,9 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Add macOS Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
@@ -73,3 +74,4 @@ jobs:
           name: CC-Switch-macOS-universal-unsigned
           path: artifacts/*
           if-no-files-found: error
+
