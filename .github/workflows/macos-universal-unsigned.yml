@@ -43,13 +43,13 @@ jobs:
 
       - name: Build universal macOS DMG
         run: |
-          pnpm tauri build --target universal-apple-darwin --bundles dmg --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          pnpm tauri build --target universal-apple-darwin --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
       - name: Verify universal binary
         shell: bash
         run: |
           set -euo pipefail
-          BIN=$(find src-tauri/target/universal-apple-darwin/release/bundle/macos -path "*.app/Contents/MacOS/*" -type f | head -1)
+          BIN="src-tauri/target/universal-apple-darwin/release/cc-switch"
           echo "Binary: $BIN"
           ARCHS=$(lipo -archs "$BIN")
           echo "Architectures: $ARCHS"
@@ -61,10 +61,12 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p artifacts
-          APP=$(find src-tauri/target/universal-apple-darwin/release/bundle/macos -maxdepth 1 -name "*.app" -type d | head -1)
           DMG=$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -maxdepth 1 -name "*.dmg" -type f | head -1)
           cp "$DMG" artifacts/CC-Switch-macOS-universal-unsigned.dmg
-          ditto -c -k --sequesterRsrc --keepParent "$APP" artifacts/CC-Switch-macOS-universal-unsigned.zip
+          APP=$(find src-tauri/target/universal-apple-darwin/release/bundle/macos -maxdepth 1 -name "*.app" -type d | head -1 || true)
+          if [ -n "$APP" ]; then
+            ditto -c -k --sequesterRsrc --keepParent "$APP" artifacts/CC-Switch-macOS-universal-unsigned.zip
+          fi
           shasum -a 256 artifacts/* > artifacts/SHA256SUMS.txt
           ls -la artifacts
 
@@ -74,4 +76,5 @@ jobs:
           name: CC-Switch-macOS-universal-unsigned
           path: artifacts/*
           if-no-files-found: error
+
 
