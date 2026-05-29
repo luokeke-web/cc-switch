@@ -1,0 +1,75 @@
+﻿name: macOS Universal Unsigned Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Branch, tag, or SHA to build"
+        required: true
+        default: "codex-macos-universal-claude-fix"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - name: Checkout selected ref
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.12.3
+          run_install: false
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build universal macOS DMG
+        run: |
+          pnpm tauri build --target universal-apple-darwin --bundles dmg --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Verify universal binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=$(find src-tauri/target/universal-apple-darwin/release/bundle/macos -path "*.app/Contents/MacOS/*" -type f | head -1)
+          echo "Binary: $BIN"
+          ARCHS=$(lipo -archs "$BIN")
+          echo "Architectures: $ARCHS"
+          grep -qw x86_64 <<< "$ARCHS"
+          grep -qw arm64 <<< "$ARCHS"
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts
+          APP=$(find src-tauri/target/universal-apple-darwin/release/bundle/macos -maxdepth 1 -name "*.app" -type d | head -1)
+          DMG=$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -maxdepth 1 -name "*.dmg" -type f | head -1)
+          cp "$DMG" artifacts/CC-Switch-macOS-universal-unsigned.dmg
+          ditto -c -k --sequesterRsrc --keepParent "$APP" artifacts/CC-Switch-macOS-universal-unsigned.zip
+          shasum -a 256 artifacts/* > artifacts/SHA256SUMS.txt
+          ls -la artifacts
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: CC-Switch-macOS-universal-unsigned
+          path: artifacts/*
+          if-no-files-found: error
