@@ -1859,7 +1859,7 @@ impl ProxyService {
             if matches!(app_type_enum, AppType::Claude) {
                 self.sync_claude_live_from_provider_while_proxy_active(&provider)
                     .await?;
-            } else if live_taken_over && matches!(app_type_enum, AppType::Codex) {
+            } else if matches!(app_type_enum, AppType::Codex) {
                 self.sync_codex_live_from_provider_while_proxy_active(&provider)
                     .await?;
             }
@@ -3808,11 +3808,110 @@ requires_openai_auth = true
             parsed_live.get("model").and_then(|v| v.as_str()),
             Some("deepseek-v4-flash")
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn hot_switch_codex_provider_updates_live_when_backup_exists_without_placeholder() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+
+        let provider_a = Provider::with_id(
+            "a".to_string(),
+            "Claude".to_string(),
+            json!({
+                "auth": {
+                    "OPENAI_API_KEY": "claude-key"
+                },
+                "config": r#"model_provider = "custom"
+model = "claude-opus-4-7"
+
+[model_providers.custom]
+name = "custom"
+base_url = "http://coding101.site/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#
+            }),
+            None,
+        );
+        let provider_b = Provider::with_id(
+            "b".to_string(),
+            "GPT".to_string(),
+            json!({
+                "auth": {
+                    "OPENAI_API_KEY": "gpt-key"
+                },
+                "config": r#"model_provider = "custom"
+model = "gpt-5.5"
+
+[model_providers.custom]
+name = "custom"
+base_url = "http://coding101.site/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#
+            }),
+            None,
+        );
+
+        db.save_provider("codex", &provider_a)
+            .expect("save provider a");
+        db.save_provider("codex", &provider_b)
+            .expect("save provider b");
+        db.set_current_provider("codex", "a")
+            .expect("set current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some("a"))
+            .expect("set local current provider");
+        db.save_live_backup(
+            "codex",
+            &serde_json::to_string(&provider_a.settings_config).expect("serialize provider a"),
+        )
+        .await
+        .expect("seed live backup");
+        service
+            .write_codex_live(&json!({
+                "auth": {
+                    "OPENAI_API_KEY": "real-live-key"
+                },
+                "config": r#"model_provider = "custom"
+model = "claude-opus-4-7"
+
+[model_providers.custom]
+name = "custom"
+base_url = "http://127.0.0.1:15721/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#
+            }))
+            .expect("seed Codex live config without takeover placeholder");
+
+        service
+            .hot_switch_provider("codex", "b")
+            .await
+            .expect("hot switch Codex provider");
+
+        let live = service.read_codex_live().expect("read Codex live config");
+        let live_config = live
+            .get("config")
+            .and_then(|v| v.as_str())
+            .expect("live config string");
+        let parsed_live: toml::Value = toml::from_str(live_config).expect("parse live config");
+
         assert_eq!(
-            live.get("auth")
-                .and_then(|auth| auth.get("OPENAI_API_KEY"))
+            parsed_live.get("model").and_then(|v| v.as_str()),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            parsed_live
+                .get("model_providers")
+                .and_then(|v| v.get("custom"))
+                .and_then(|v| v.get("base_url"))
                 .and_then(|v| v.as_str()),
-            Some(PROXY_TOKEN_PLACEHOLDER)
+            Some("http://127.0.0.1:15721/v1")
         );
     }
 

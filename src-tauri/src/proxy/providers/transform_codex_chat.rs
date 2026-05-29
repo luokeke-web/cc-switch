@@ -50,6 +50,8 @@ pub fn responses_to_chat_completions_with_reasoning(
     if let Some(model) = body.get("model") {
         result["model"] = model.clone();
     }
+    let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    let uses_anthropic_chat_tools = model.to_ascii_lowercase().contains("claude");
 
     let mut messages = Vec::new();
     if let Some(instructions) = body.get("instructions") {
@@ -66,9 +68,17 @@ pub fn responses_to_chat_completions_with_reasoning(
         append_responses_input_as_chat_messages(input, &mut messages)?;
     }
     let messages = collapse_system_messages_to_head(messages);
-    result["messages"] = json!(messages);
+    if uses_anthropic_chat_tools {
+        let messages = convert_chat_messages_to_anthropic_messages(messages);
+        let (system, messages) = move_system_messages_to_top_level(messages);
+        if let Some(system) = system {
+            result["system"] = json!(system);
+        }
+        result["messages"] = json!(messages);
+    } else {
+        result["messages"] = json!(messages);
+    }
 
-    let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
     if let Some(max_tokens) = body.get("max_output_tokens") {
         if super::transform::is_openai_o_series(model) {
             result["max_completion_tokens"] = max_tokens.clone();
@@ -94,7 +104,13 @@ pub fn responses_to_chat_completions_with_reasoning(
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
         let tools: Vec<Value> = tools
             .iter()
-            .filter_map(responses_tool_to_chat_tool)
+            .filter_map(|tool| {
+                if uses_anthropic_chat_tools {
+                    responses_tool_to_anthropic_chat_tool(tool)
+                } else {
+                    responses_tool_to_chat_tool(tool)
+                }
+            })
             .collect();
         if !tools.is_empty() {
             result["tools"] = json!(tools);
@@ -102,7 +118,11 @@ pub fn responses_to_chat_completions_with_reasoning(
     }
 
     if let Some(tool_choice) = body.get("tool_choice") {
-        result["tool_choice"] = responses_tool_choice_to_chat(tool_choice);
+        result["tool_choice"] = if uses_anthropic_chat_tools {
+            responses_tool_choice_to_anthropic_chat(tool_choice)
+        } else {
+            responses_tool_choice_to_chat(tool_choice)
+        };
     }
 
     for key in EXTRA_CHAT_PASSTHROUGH_FIELDS {
@@ -308,6 +328,277 @@ fn collapse_system_messages_to_head(messages: Vec<Value>) -> Vec<Value> {
     }
     out.extend(rest);
     out
+}
+
+fn move_system_messages_to_top_level(messages: Vec<Value>) -> (Option<String>, Vec<Value>) {
+    let mut system_chunks: Vec<String> = Vec::new();
+    let mut rest: Vec<Value> = Vec::with_capacity(messages.len());
+
+    for msg in messages {
+        if msg.get("role").and_then(|v| v.as_str()) == Some("system") {
+            if let Some(text) = system_message_text(&msg) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    system_chunks.push(text);
+                }
+            }
+            continue;
+        }
+        rest.push(msg);
+    }
+
+    let system = if system_chunks.is_empty() {
+        None
+    } else {
+        Some(system_chunks.join("\n\n"))
+    };
+    (system, rest)
+}
+
+fn system_message_text(message: &Value) -> Option<String> {
+    match message.get("content")? {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| part.as_str())
+                })
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        }
+        other => other.as_str().map(|s| s.to_string()),
+    }
+}
+
+fn convert_chat_messages_to_anthropic_messages(messages: Vec<Value>) -> Vec<Value> {
+    let mut converted: Vec<Value> = Vec::with_capacity(messages.len());
+
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("user");
+        let next = match role {
+            "system" => normalize_anthropic_message(&message, "system"),
+            "assistant" if chat_message_has_tool_calls(&message) => {
+                chat_assistant_message_to_anthropic_tool_use(&message)
+            }
+            "assistant" => normalize_anthropic_message(&message, "assistant"),
+            "tool" => chat_tool_message_to_anthropic_tool_result(&message),
+            _ => normalize_anthropic_message(&message, "user"),
+        };
+
+        push_or_merge_anthropic_message(&mut converted, next);
+    }
+
+    converted
+}
+
+fn normalize_anthropic_message(message: &Value, role: &str) -> Value {
+    let blocks =
+        anthropic_content_blocks_from_chat_content(message.get("content").unwrap_or(&Value::Null));
+    json!({
+        "role": role,
+        "content": blocks
+    })
+}
+
+fn chat_message_has_tool_calls(message: &Value) -> bool {
+    message
+        .get("tool_calls")
+        .and_then(|v| v.as_array())
+        .is_some_and(|calls| !calls.is_empty())
+        || message.get("function_call").is_some()
+}
+
+fn chat_assistant_message_to_anthropic_tool_use(message: &Value) -> Value {
+    let mut content =
+        anthropic_content_blocks_from_chat_content(message.get("content").unwrap_or(&Value::Null));
+
+    if let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
+        for (index, tool_call) in tool_calls.iter().enumerate() {
+            content.push(chat_tool_call_to_anthropic_tool_use(tool_call, index));
+        }
+    }
+
+    if let Some(function_call) = message.get("function_call") {
+        content.push(chat_legacy_function_call_to_anthropic_tool_use(
+            function_call,
+        ));
+    }
+
+    json!({
+        "role": "assistant",
+        "content": content
+    })
+}
+
+fn chat_tool_message_to_anthropic_tool_result(message: &Value) -> Value {
+    let tool_use_id = message
+        .get("tool_call_id")
+        .or_else(|| message.get("call_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let content = match message.get("content").unwrap_or(&Value::Null) {
+        Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        other => canonical_json_string(other),
+    };
+
+    json!({
+        "role": "user",
+        "content": [{
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": content
+        }]
+    })
+}
+
+fn chat_tool_call_to_anthropic_tool_use(tool_call: &Value, index: usize) -> Value {
+    let id = tool_call
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("call_{index}"));
+    let function = tool_call.get("function").unwrap_or(&Value::Null);
+    let name = function.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let input = parse_anthropic_tool_input(function.get("arguments"));
+
+    json!({
+        "type": "tool_use",
+        "id": id,
+        "name": name,
+        "input": input
+    })
+}
+
+fn chat_legacy_function_call_to_anthropic_tool_use(function_call: &Value) -> Value {
+    let id = function_call
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .unwrap_or("call_0");
+    let name = function_call
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let input = parse_anthropic_tool_input(function_call.get("arguments"));
+
+    json!({
+        "type": "tool_use",
+        "id": id,
+        "name": name,
+        "input": input
+    })
+}
+
+fn parse_anthropic_tool_input(arguments: Option<&Value>) -> Value {
+    match arguments {
+        Some(Value::String(text)) => serde_json::from_str(text).unwrap_or_else(|_| {
+            json!({
+                "arguments": text
+            })
+        }),
+        Some(Value::Object(_)) => arguments.cloned().unwrap_or_else(|| json!({})),
+        Some(value) if value.is_null() => json!({}),
+        Some(value) => json!({
+            "arguments": value
+        }),
+        None => json!({}),
+    }
+}
+
+fn anthropic_content_blocks_from_chat_content(content: &Value) -> Vec<Value> {
+    match content {
+        Value::Null => Vec::new(),
+        Value::String(text) => {
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![json!({
+                    "type": "text",
+                    "text": text
+                })]
+            }
+        }
+        Value::Array(parts) => {
+            let mut blocks = Vec::new();
+            for part in parts {
+                match part {
+                    Value::String(text) if !text.is_empty() => {
+                        blocks.push(json!({
+                            "type": "text",
+                            "text": text
+                        }));
+                    }
+                    Value::Object(obj) => {
+                        let part_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        match part_type {
+                            "text" | "tool_use" | "tool_result" => blocks.push(part.clone()),
+                            "output_text" | "input_text" => {
+                                if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                                    if !text.is_empty() {
+                                        blocks.push(json!({
+                                            "type": "text",
+                                            "text": text
+                                        }));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    other if !other.is_null() => {
+                        blocks.push(json!({
+                            "type": "text",
+                            "text": canonical_json_string(other)
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+            blocks
+        }
+        other => vec![json!({
+            "type": "text",
+            "text": canonical_json_string(other)
+        })],
+    }
+}
+
+fn push_or_merge_anthropic_message(messages: &mut Vec<Value>, next: Value) {
+    let role = next.get("role").and_then(|v| v.as_str()).unwrap_or("");
+    if role == "system" {
+        messages.push(next);
+        return;
+    }
+
+    if let Some(previous) = messages.last_mut() {
+        let previous_role = previous.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if previous_role == role {
+            let mut previous_blocks = anthropic_content_blocks_from_chat_content(
+                previous.get("content").unwrap_or(&Value::Null),
+            );
+            previous_blocks.extend(anthropic_content_blocks_from_chat_content(
+                next.get("content").unwrap_or(&Value::Null),
+            ));
+            previous["content"] = json!(previous_blocks);
+            return;
+        }
+    }
+
+    messages.push(next);
 }
 
 fn instruction_text(value: &Value) -> String {
@@ -780,6 +1071,39 @@ fn responses_tool_to_chat_tool(tool: &Value) -> Option<Value> {
     }))
 }
 
+fn responses_tool_to_anthropic_chat_tool(tool: &Value) -> Option<Value> {
+    if tool.get("type").and_then(|v| v.as_str()) != Some("function") {
+        return None;
+    }
+
+    let function = tool.get("function");
+    let name = function
+        .and_then(|f| f.get("name"))
+        .or_else(|| tool.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if name.is_empty() {
+        return None;
+    }
+
+    let description = function
+        .and_then(|f| f.get("description"))
+        .or_else(|| tool.get("description"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let parameters = function
+        .and_then(|f| f.get("parameters"))
+        .or_else(|| tool.get("parameters"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    Some(json!({
+        "name": name,
+        "description": description,
+        "input_schema": super::transform::clean_schema(parameters)
+    }))
+}
+
 fn responses_tool_choice_to_chat(tool_choice: &Value) -> Value {
     match tool_choice {
         Value::Object(obj) if obj.get("type").and_then(|v| v.as_str()) == Some("function") => {
@@ -788,6 +1112,27 @@ fn responses_tool_choice_to_chat(tool_choice: &Value) -> Value {
                 "function": {
                     "name": obj.get("name").and_then(|v| v.as_str()).unwrap_or("")
                 }
+            })
+        }
+        _ => tool_choice.clone(),
+    }
+}
+
+fn responses_tool_choice_to_anthropic_chat(tool_choice: &Value) -> Value {
+    match tool_choice {
+        Value::String(value) => match value.as_str() {
+            "auto" | "none" => json!({ "type": value }),
+            "required" => json!({ "type": "any" }),
+            _ => tool_choice.clone(),
+        },
+        Value::Object(obj) if obj.get("type").and_then(|v| v.as_str()) == Some("function") => {
+            json!({
+                "type": "tool",
+                "name": obj
+                    .get("name")
+                    .or_else(|| obj.get("function").and_then(|v| v.get("name")))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
             })
         }
         _ => tool_choice.clone(),
@@ -1246,6 +1591,292 @@ mod tests {
         assert_eq!(result["tool_choice"]["function"]["name"], "get_weather");
         assert_eq!(result["max_tokens"], 100);
         assert_eq!(result["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn responses_request_to_chat_maps_claude_tools_to_anthropic_shape() {
+        let input = json!({
+            "model": "claude-opus-4-7",
+            "input": "Weather?",
+            "tools": [{
+                "type": "function",
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {"type": "object", "properties": {}}
+            }],
+            "tool_choice": "auto"
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+
+        assert_eq!(result["tools"][0]["name"], "get_weather");
+        assert_eq!(result["tools"][0]["input_schema"]["type"], "object");
+        assert!(result["tools"][0].get("function").is_none());
+        assert_eq!(result["tool_choice"]["type"], "auto");
+    }
+
+    #[test]
+    fn responses_request_to_chat_maps_claude_forced_tool_choice() {
+        let input = json!({
+            "model": "claude-opus-4-7",
+            "input": "Weather?",
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {"type": "object"}
+                }
+            }],
+            "tool_choice": {"type": "function", "name": "get_weather"}
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+
+        assert_eq!(result["tools"][0]["name"], "get_weather");
+        assert_eq!(result["tool_choice"]["type"], "tool");
+        assert_eq!(result["tool_choice"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn responses_request_to_chat_moves_claude_system_messages_to_top_level() {
+        let input = json!({
+            "model": "claude-opus-4-7",
+            "instructions": "You are concise.",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": "Use short answers."
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "hello"
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(result["system"], "You are concise.\n\nUse short answers.");
+        assert!(messages
+            .iter()
+            .all(|message| message.get("role").and_then(|v| v.as_str()) != Some("system")));
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["type"], "text");
+        assert_eq!(messages[0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn responses_request_to_chat_converts_claude_tool_history_to_anthropic_blocks() {
+        let input = json!({
+            "model": "claude-opus-4-7",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Tokyo\"}",
+                    "reasoning_content": "Need weather."
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "Sunny"
+                },
+                {
+                    "role": "user",
+                    "content": "Continue"
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert!(messages
+            .iter()
+            .all(|message| message.get("role").and_then(|v| v.as_str()) != Some("tool")));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert!(messages[0].get("reasoning_content").is_none());
+        assert!(messages[0].get("tool_calls").is_none());
+        assert_eq!(messages[0]["content"][0]["type"], "tool_use");
+        assert_eq!(messages[0]["content"][0]["id"], "call_1");
+        assert_eq!(messages[0]["content"][0]["name"], "get_weather");
+        assert_eq!(messages[0]["content"][0]["input"]["city"], "Tokyo");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[1]["content"][0]["tool_use_id"], "call_1");
+        assert_eq!(messages[1]["content"][0]["content"], "Sunny");
+        assert_eq!(messages[1]["content"][1]["type"], "text");
+        assert_eq!(messages[1]["content"][1]["text"], "Continue");
+    }
+
+    #[test]
+    fn responses_request_to_chat_handles_claude_multi_turn_tool_loop() {
+        let input = json!({
+            "model": "claude-opus-4-7",
+            "instructions": "You are concise.",
+            "input": [
+                {"type": "message", "role": "user", "content": "Please read README.md"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"README.md\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "First chunk"
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "Need more context."
+                },
+                {"type": "message", "role": "user", "content": "Continue and read more"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_2",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"docs/intro.md\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_2",
+                    "output": {"lines": ["intro line 1", "intro line 2"]}
+                },
+                {"type": "message", "role": "user", "content": "Summarize."}
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        // Claude ???顶层 system + user/assistant 交替，不能有 role:"tool"，tool_use_id 成对
+        assert_eq!(result["system"], "You are concise.");
+        assert!(messages
+            .iter()
+            .all(|m| m.get("role").and_then(|v| v.as_str()) != Some("tool")));
+        assert!(messages
+            .iter()
+            .all(|m| m.get("role").and_then(|v| v.as_str()) != Some("system")));
+
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|m| m.get("role").and_then(|v| v.as_str()).unwrap_or(""))
+            .collect();
+        // user(prompt) -> assistant(tool_use1) -> user(tool_result1) -> assistant(text) -> user(continue) -> assistant(tool_use2) -> user(tool_result2 + summarize)
+        assert_eq!(
+            roles,
+            vec![
+                "user",
+                "assistant",
+                "user",
+                "assistant",
+                "user",
+                "assistant",
+                "user"
+            ]
+        );
+
+        // 首轮工具调用
+        let first_assistant = &messages[1];
+        assert!(first_assistant.get("tool_calls").is_none());
+        assert_eq!(first_assistant["content"][0]["type"], "tool_use");
+        assert_eq!(first_assistant["content"][0]["id"], "call_1");
+        assert_eq!(first_assistant["content"][0]["name"], "read_file");
+        assert_eq!(first_assistant["content"][0]["input"]["path"], "README.md");
+
+        let first_tool_result = &messages[2];
+        assert_eq!(first_tool_result["content"][0]["type"], "tool_result");
+        assert_eq!(first_tool_result["content"][0]["tool_use_id"], "call_1");
+        assert_eq!(first_tool_result["content"][0]["content"], "First chunk");
+
+        // 中间纯文本交互
+        assert_eq!(messages[3]["content"][0]["type"], "text");
+        assert_eq!(messages[3]["content"][0]["text"], "Need more context.");
+        assert_eq!(messages[4]["content"][0]["type"], "text");
+        assert_eq!(messages[4]["content"][0]["text"], "Continue and read more");
+
+        // 第二轮工具调用，输出是对象，应序列化为规范化 JSON 字符串
+        let second_assistant = &messages[5];
+        assert_eq!(second_assistant["content"][0]["type"], "tool_use");
+        assert_eq!(second_assistant["content"][0]["id"], "call_2");
+        assert_eq!(second_assistant["content"][0]["name"], "read_file");
+        assert_eq!(
+            second_assistant["content"][0]["input"]["path"],
+            "docs/intro.md"
+        );
+
+        // 第二轮 tool_result + 后续 user "Summarize." 合并到同一条 user 里（保证交替）
+        let last_user = &messages[6];
+        assert_eq!(last_user["content"][0]["type"], "tool_result");
+        assert_eq!(last_user["content"][0]["tool_use_id"], "call_2");
+        assert_eq!(
+            last_user["content"][0]["content"],
+            "{\"lines\":[\"intro line 1\",\"intro line 2\"]}"
+        );
+        assert_eq!(last_user["content"][1]["type"], "text");
+        assert_eq!(last_user["content"][1]["text"], "Summarize.");
+
+        // tool_use 与 tool_result 的 id 一一配对
+        let mut tool_use_ids = Vec::new();
+        let mut tool_result_ids = Vec::new();
+        for message in messages {
+            if let Some(parts) = message.get("content").and_then(|v| v.as_array()) {
+                for part in parts {
+                    match part.get("type").and_then(|v| v.as_str()) {
+                        Some("tool_use") => {
+                            tool_use_ids
+                                .push(part.get("id").and_then(|v| v.as_str()).unwrap_or(""));
+                        }
+                        Some("tool_result") => {
+                            tool_result_ids.push(
+                                part.get("tool_use_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(""),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert_eq!(tool_use_ids, vec!["call_1", "call_2"]);
+        assert_eq!(tool_result_ids, vec!["call_1", "call_2"]);
+    }
+
+    #[test]
+    fn responses_request_to_chat_keeps_openai_tool_history_for_non_claude_models() {
+        let input = json!({
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Tokyo\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "Sunny"
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call_1");
     }
 
     #[test]
